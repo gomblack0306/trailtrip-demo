@@ -1,10 +1,20 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+function getSupabaseAdmin() {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+  if (!supabaseUrl) {
+    throw new Error('NEXT_PUBLIC_SUPABASE_URL is missing');
+  }
+
+  if (!supabaseServiceRoleKey) {
+    throw new Error('SUPABASE_SERVICE_ROLE_KEY is missing');
+  }
+
+  return createClient(supabaseUrl, supabaseServiceRoleKey);
+}
 
 export async function GET() {
   return NextResponse.json({
@@ -15,6 +25,8 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   try {
+    const supabase = getSupabaseAdmin();
+
     const body = await req.json();
     const { sessionId, lat, lng, accuracy } = body;
 
@@ -65,7 +77,12 @@ export async function POST(req: NextRequest) {
     console.error('[TRACKING_POINT_POST]', error);
 
     return NextResponse.json(
-      { error: '위치 저장에 실패했습니다.' },
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : '위치 저장에 실패했습니다.',
+      },
       { status: 500 }
     );
   }
