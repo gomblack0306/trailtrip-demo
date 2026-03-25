@@ -5,13 +5,14 @@ import { useRouter } from 'next/navigation';
 import { createClient } from '@/lib/supabase/client';
 
 export default function LoginPage() {
-  const supabase = createClient();
   const router = useRouter();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
   const handleLogin = async () => {
+    const supabase = createClient();
+
     const { error } = await supabase.auth.signInWithPassword({
       email,
       password,
@@ -26,6 +27,8 @@ export default function LoginPage() {
   };
 
   const handleSignup = async () => {
+    const supabase = createClient();
+
     const { error } = await supabase.auth.signUp({
       email,
       password,
