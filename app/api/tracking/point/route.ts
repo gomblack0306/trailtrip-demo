@@ -1,0 +1,72 @@
+import { NextRequest, NextResponse } from 'next/server';
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+
+export async function GET() {
+  return NextResponse.json({
+    ok: true,
+    message: 'tracking point api alive',
+  });
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json();
+    const { sessionId, lat, lng, accuracy } = body;
+
+    if (!sessionId || typeof lat !== 'number' || typeof lng !== 'number') {
+      return NextResponse.json(
+        { error: 'sessionId, lat, lng는 필수입니다.' },
+        { status: 400 }
+      );
+    }
+
+    const recorded_at = new Date().toISOString();
+
+    const { data, error } = await supabase
+      .from('trekking_points')
+      .insert({
+        session_id: sessionId,
+        lat,
+        lng,
+        accuracy: typeof accuracy === 'number' ? accuracy : null,
+        recorded_at,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      console.error('[TRACKING_POINT_INSERT_ERROR]', error);
+      return NextResponse.json(
+        { error: 'DB에 위치 저장 실패' },
+        { status: 500 }
+      );
+    }
+
+    return NextResponse.json(
+      {
+        ok: true,
+        point: {
+          id: data.id,
+          session_id: data.session_id,
+          lat: data.lat,
+          lng: data.lng,
+          accuracy: data.accuracy,
+          recorded_at: data.recorded_at,
+        },
+      },
+      { status: 200 }
+    );
+  } catch (error) {
+    console.error('[TRACKING_POINT_POST]', error);
+
+    return NextResponse.json(
+      { error: '위치 저장에 실패했습니다.' },
+      { status: 500 }
+    );
+  }
+}
