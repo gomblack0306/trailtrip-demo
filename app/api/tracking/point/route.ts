@@ -26,7 +26,6 @@ export async function GET() {
 export async function POST(req: NextRequest) {
   try {
     const supabase = getSupabaseAdmin();
-
     const body = await req.json();
     const { sessionId, lat, lng, accuracy } = body;
 
@@ -34,6 +33,30 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(
         { error: 'sessionId, lat, lng는 필수입니다.' },
         { status: 400 }
+      );
+    }
+
+    const { data: activeSession, error: sessionError } = await supabase
+      .from('trekking_sessions')
+      .select('id, status')
+      .eq('id', sessionId)
+      .eq('status', 'active')
+      .maybeSingle();
+
+    if (sessionError) {
+      return NextResponse.json(
+        {
+          error: '세션 확인 실패',
+          detail: sessionError.message,
+        },
+        { status: 500 }
+      );
+    }
+
+    if (!activeSession) {
+      return NextResponse.json(
+        { error: '활성 세션이 없어서 위치를 저장할 수 없습니다.' },
+        { status: 404 }
       );
     }
 
@@ -54,7 +77,7 @@ export async function POST(req: NextRequest) {
     if (error) {
       console.error('[TRACKING_POINT_INSERT_ERROR]', error);
       return NextResponse.json(
-        { error: 'DB에 위치 저장 실패' },
+        { error: 'DB에 위치 저장 실패', detail: error.message },
         { status: 500 }
       );
     }

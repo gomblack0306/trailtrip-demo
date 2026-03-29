@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 
 declare global {
   interface Window {
@@ -12,6 +12,7 @@ type Session = {
   id: string;
   status: string;
   started_at: string;
+  ended_at?: string | null;
 };
 
 type Point = {
@@ -24,19 +25,19 @@ type Point = {
 
 const STORAGE_KEY = 'trailtrip_tracking_session';
 const DEFAULT_CENTER = { lat: 33.3617, lng: 126.5292 };
+const DEFAULT_TRAIL_ID = 'demo-trail-001';
+const AUTO_SAVE_MIN_DISTANCE_METERS = 12;
+const AUTO_SAVE_MIN_INTERVAL_MS = 20_000;
+const AUTO_SAVE_MAX_ACCURACY_METERS = 80;
 
-/**
- * 임시 기본 코스 라인
- * 나중에 하귀-협재 GPX 좌표로 교체
- */
 const DEFAULT_COURSE_PATH: Point[] = [
   { lat: 33.3617, lng: 126.5292 },
   { lat: 33.3621, lng: 126.5301 },
   { lat: 33.3628, lng: 126.5312 },
   { lat: 33.3636, lng: 126.5321 },
-  { lat: 33.3645, lng: 126.5330 },
-  { lat: 33.3652, lng: 126.5340 },
-  { lat: 33.3659, lng: 126.5350 },
+  { lat: 33.3645, lng: 126.533 },
+  { lat: 33.3652, lng: 126.534 },
+  { lat: 33.3659, lng: 126.535 },
 ];
 
 function getDistanceMeters(
@@ -46,7 +47,6 @@ function getDistanceMeters(
   const R = 6371000;
   const dLat = ((b.lat - a.lat) * Math.PI) / 180;
   const dLng = ((b.lng - a.lng) * Math.PI) / 180;
-
   const lat1 = (a.lat * Math.PI) / 180;
   const lat2 = (b.lat * Math.PI) / 180;
 
@@ -61,6 +61,28 @@ function getDistanceMeters(
   return R * y;
 }
 
+function formatMeters(meters: number) {
+  if (meters < 1000) return `${Math.round(meters)}m`;
+  return `${(meters / 1000).toFixed(2)}km`;
+}
+
+function formatDuration(ms: number) {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}시간 ${minutes}분`;
+  }
+
+  if (minutes > 0) {
+    return `${minutes}분 ${seconds}초`;
+  }
+
+  return `${seconds}초`;
+}
+
 export default function TrackingPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
@@ -70,26 +92,53 @@ export default function TrackingPage() {
   const [ending, setEnding] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pointMessage, setPointMessage] = useState<string | null>(null);
-
   const [savedPoints, setSavedPoints] = useState<Point[]>([]);
   const [coursePath] = useState<Point[]>(DEFAULT_COURSE_PATH);
   const [livePath, setLivePath] = useState<Point[]>([]);
   const [currentPosition, setCurrentPosition] = useState<Point | null>(null);
   const [isWatching, setIsWatching] = useState(false);
+  const [nowTs, setNowTs] = useState(Date.now());
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
-
   const basePolylineRef = useRef<any>(null);
   const livePolylineRef = useRef<any>(null);
   const savedPolylineRef = useRef<any>(null);
   const currentMarkerRef = useRef<any>(null);
   const savedMarkersRef = useRef<any[]>([]);
   const watchIdRef = useRef<number | null>(null);
+  const lastSavedPointRef = useRef<Point | null>(null);
+  const lastSavedAtRef = useRef<number>(0);
+  const autoSavingRef = useRef(false);
+
+  const savedDistanceMeters = useMemo(() => {
+    if (savedPoints.length < 2) return 0;
+    let total = 0;
+    for (let i = 1; i < savedPoints.length; i += 1) {
+      total += getDistanceMeters(savedPoints[i - 1], savedPoints[i]);
+    }
+    return total;
+  }, [savedPoints]);
+
+  const startedAtMs = session?.started_at ? new Date(session.started_at).getTime() : 0;
+  const elapsedMs = session ? nowTs - startedAtMs : 0;
+  const averagePaceMinPerKm = savedDistanceMeters > 0
+    ? elapsedMs / 1000 / 60 / (savedDistanceMeters / 1000)
+    : 0;
 
   useEffect(() => {
     restoreSession();
   }, []);
+
+  useEffect(() => {
+    if (!session?.id) return;
+
+    const timer = window.setInterval(() => {
+      setNowTs(Date.now());
+    }, 1000);
+
+    return () => window.clearInterval(timer);
+  }, [session?.id]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -108,6 +157,8 @@ export default function TrackingPage() {
       setSavedPoints([]);
       setLivePath([]);
       setCurrentPosition(null);
+      lastSavedPointRef.current = null;
+      lastSavedAtRef.current = 0;
     }
 
     return () => {
@@ -142,12 +193,15 @@ export default function TrackingPage() {
 
       const parsed = JSON.parse(raw);
 
-      if (parsed?.id && parsed?.status) {
+      if (parsed?.id && parsed?.status === 'active') {
         setSession({
           id: parsed.id,
           status: parsed.status,
           started_at: parsed.started_at ?? new Date().toISOString(),
+          ended_at: parsed.ended_at ?? null,
         });
+      } else {
+        localStorage.removeItem(STORAGE_KEY);
       }
     } catch (err) {
       console.error('세션 복구 실패:', err);
@@ -212,10 +266,6 @@ export default function TrackingPage() {
       strokeStyle: 'solid',
       zIndex: 1,
     });
-
-    const bounds = new window.kakao.maps.LatLngBounds();
-    path.forEach((latlng) => bounds.extend(latlng));
-    mapRef.current.setBounds(bounds);
   }
 
   function renderSavedPointsAndPath() {
@@ -249,11 +299,11 @@ export default function TrackingPage() {
       savedPolylineRef.current = new window.kakao.maps.Polyline({
         map: mapRef.current,
         path,
-        strokeWeight: 4,
-        strokeColor: '#7c8aa5',
-        strokeOpacity: 0.75,
-        strokeStyle: 'shortdash',
-        zIndex: 2,
+        strokeWeight: 5,
+        strokeColor: '#0A84FF',
+        strokeOpacity: 0.95,
+        strokeStyle: 'solid',
+        zIndex: 3,
       });
     }
   }
@@ -277,8 +327,8 @@ export default function TrackingPage() {
       path,
       strokeWeight: 7,
       strokeColor: '#1565C0',
-      strokeOpacity: 0.95,
-      strokeStyle: 'solid',
+      strokeOpacity: 0.5,
+      strokeStyle: 'shortdash',
       zIndex: 4,
     });
   }
@@ -315,6 +365,86 @@ export default function TrackingPage() {
     currentMarkerRef.current.setMap(mapRef.current);
   }
 
+  async function persistPoint(point: Point, source: 'manual' | 'auto') {
+    if (!session?.id) {
+      return false;
+    }
+
+    const res = await fetch('/api/tracking/point', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        sessionId: session.id,
+        lat: point.lat,
+        lng: point.lng,
+        accuracy: point.accuracy ?? null,
+      }),
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`위치 저장 실패: ${res.status} ${text}`);
+    }
+
+    const data = await res.json();
+    const newPoint: Point = {
+      id: data.point.id,
+      lat: data.point.lat,
+      lng: data.point.lng,
+      accuracy: data.point.accuracy,
+      recorded_at: data.point.recorded_at,
+    };
+
+    setSavedPoints((prev) => [...prev, newPoint]);
+    lastSavedPointRef.current = newPoint;
+    lastSavedAtRef.current = Date.now();
+
+    if (source === 'manual') {
+      setPointMessage(
+        `위치 저장 완료 (${newPoint.lat.toFixed(5)}, ${newPoint.lng.toFixed(5)})`
+      );
+    } else {
+      setPointMessage(`자동 저장 완료 · ${formatMeters(savedDistanceMeters)}`);
+    }
+
+    return true;
+  }
+
+  async function tryAutoSave(point: Point) {
+    if (!session?.id || autoSavingRef.current) return;
+    if (typeof point.accuracy === 'number' && point.accuracy > AUTO_SAVE_MAX_ACCURACY_METERS) return;
+
+    const now = Date.now();
+    const lastPoint = lastSavedPointRef.current;
+    const timeEnough = now - lastSavedAtRef.current >= AUTO_SAVE_MIN_INTERVAL_MS;
+
+    if (!lastPoint) {
+      autoSavingRef.current = true;
+      try {
+        await persistPoint(point, 'auto');
+      } catch (err) {
+        console.error('자동 저장 실패:', err);
+      } finally {
+        autoSavingRef.current = false;
+      }
+      return;
+    }
+
+    const distance = getDistanceMeters(lastPoint, point);
+    if (!timeEnough || distance < AUTO_SAVE_MIN_DISTANCE_METERS) return;
+
+    autoSavingRef.current = true;
+    try {
+      await persistPoint(point, 'auto');
+    } catch (err) {
+      console.error('자동 저장 실패:', err);
+    } finally {
+      autoSavingRef.current = false;
+    }
+  }
+
   function startWatchingPosition() {
     if (!navigator.geolocation) {
       setError('이 브라우저에서는 위치 정보를 지원하지 않아.');
@@ -333,17 +463,14 @@ export default function TrackingPage() {
         };
 
         setCurrentPosition(point);
+        tryAutoSave(point);
 
         setLivePath((prev) => {
           const last = prev[prev.length - 1];
-
           if (!last) return [point];
 
           const distance = getDistanceMeters(last, point);
-
-          if (distance < 5) {
-            return prev;
-          }
+          if (distance < 5) return prev;
 
           return [...prev, point];
         });
@@ -353,8 +480,8 @@ export default function TrackingPage() {
       },
       {
         enableHighAccuracy: true,
-        timeout: 10000,
-        maximumAge: 3000,
+        timeout: 15000,
+        maximumAge: 5000,
       }
     );
 
@@ -381,10 +508,12 @@ export default function TrackingPage() {
 
   function fitCourseBounds() {
     if (!mapRef.current || !window.kakao || !window.kakao.maps) return;
-    if (!coursePath.length) return;
+
+    const targetPoints = savedPoints.length ? savedPoints : coursePath;
+    if (!targetPoints.length) return;
 
     const bounds = new window.kakao.maps.LatLngBounds();
-    coursePath.forEach((point) => {
+    targetPoints.forEach((point) => {
       bounds.extend(new window.kakao.maps.LatLng(point.lat, point.lng));
     });
 
@@ -406,7 +535,13 @@ export default function TrackingPage() {
       }
 
       const data = await res.json();
-      setSavedPoints(Array.isArray(data.points) ? data.points : []);
+      const points = Array.isArray(data.points) ? data.points : [];
+      setSavedPoints(points);
+
+      if (points.length > 0) {
+        lastSavedPointRef.current = points[points.length - 1];
+        lastSavedAtRef.current = Date.now();
+      }
     } catch (err) {
       console.error(err);
       setError(
@@ -425,6 +560,13 @@ export default function TrackingPage() {
 
       const res = await fetch('/api/session', {
         method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          trailId: DEFAULT_TRAIL_ID,
+          reuseActive: true,
+        }),
       });
 
       if (!res.ok) {
@@ -433,18 +575,21 @@ export default function TrackingPage() {
       }
 
       const data = await res.json();
-
       const newSession: Session = {
-        id: data.id,
-        status: data.status ?? 'active',
-        started_at: data.started_at ?? new Date().toISOString(),
+        id: data.session.id,
+        status: data.session.status ?? 'active',
+        started_at: data.session.started_at ?? new Date().toISOString(),
+        ended_at: data.session.ended_at ?? null,
       };
 
       setSession(newSession);
+      setNowTs(Date.now());
       localStorage.setItem(STORAGE_KEY, JSON.stringify(newSession));
       setSavedPoints([]);
       setLivePath([]);
       setCurrentPosition(null);
+      lastSavedPointRef.current = null;
+      lastSavedAtRef.current = 0;
     } catch (err) {
       console.error(err);
       setError(
@@ -464,31 +609,76 @@ export default function TrackingPage() {
     setSavedPoints([]);
     setLivePath([]);
     setCurrentPosition(null);
+    lastSavedPointRef.current = null;
+    lastSavedAtRef.current = 0;
   }
 
   async function handleRestart() {
-    stopWatchingPosition();
-    localStorage.removeItem(STORAGE_KEY);
-    setSession(null);
-    setError(null);
-    setPointMessage(null);
-    setSavedPoints([]);
-    setLivePath([]);
-    setCurrentPosition(null);
+    if (session?.id) {
+      const confirmed = window.confirm('현재 진행 중인 세션을 종료하고 새 세션을 시작할까?');
+      if (!confirmed) return;
+
+      const ended = await handleEndTracking({ quiet: true });
+      if (!ended) return;
+    }
+
     await handleStartTracking();
   }
 
-  function handleEndTracking() {
+  async function handleEndTracking(options?: { quiet?: boolean }) {
+    if (!session?.id) {
+      setError('종료할 세션이 없어.');
+      return false;
+    }
+
     try {
       setEnding(true);
+      setError(null);
+      setPointMessage(null);
+
+      if (currentPosition) {
+        try {
+          await persistPoint(currentPosition, 'auto');
+        } catch (finalPointError) {
+          console.error('종료 직전 마지막 포인트 저장 실패:', finalPointError);
+        }
+      }
+
+      const res = await fetch('/api/session', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: session.id,
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`세션 종료 실패: ${res.status} ${text}`);
+      }
+
       stopWatchingPosition();
       localStorage.removeItem(STORAGE_KEY);
       setSession(null);
-      setPointMessage('트래킹을 종료했어.');
-      setError(null);
       setSavedPoints([]);
       setLivePath([]);
       setCurrentPosition(null);
+      lastSavedPointRef.current = null;
+      lastSavedAtRef.current = 0;
+
+      if (!options?.quiet) {
+        setPointMessage('트래킹을 종료했고 마지막 위치까지 저장했어.');
+      }
+
+      return true;
+    } catch (err) {
+      console.error(err);
+      setError(
+        err instanceof Error ? err.message : '트래킹 종료 중 오류가 발생했어.'
+      );
+      return false;
     } finally {
       setEnding(false);
     }
@@ -509,39 +699,7 @@ export default function TrackingPage() {
       setSavingPoint(true);
       setError(null);
       setPointMessage(null);
-
-      const res = await fetch('/api/tracking/point', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          sessionId: session.id,
-          lat: currentPosition.lat,
-          lng: currentPosition.lng,
-          accuracy: currentPosition.accuracy ?? null,
-        }),
-      });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`위치 저장 실패: ${res.status} ${text}`);
-      }
-
-      const data = await res.json();
-
-      const newPoint: Point = {
-        id: data.point.id,
-        lat: data.point.lat,
-        lng: data.point.lng,
-        accuracy: data.point.accuracy,
-        recorded_at: data.point.recorded_at,
-      };
-
-      setSavedPoints((prev) => [...prev, newPoint]);
-      setPointMessage(
-        `위치 저장 완료 (${data.point.lat.toFixed(5)}, ${data.point.lng.toFixed(5)})`
-      );
+      await persistPoint(currentPosition, 'manual');
     } catch (err) {
       console.error(err);
       setError(
@@ -582,28 +740,18 @@ export default function TrackingPage() {
           <>
             <div style={styles.statusBox}>
               <p style={styles.label}>현재 트래킹 진행 중</p>
-              <p style={styles.metaText}>
-                <strong>상태:</strong> {session.status}
-              </p>
-              <p style={styles.metaText}>
-                <strong>시작 시간:</strong>{' '}
-                {new Date(session.started_at).toLocaleString()}
-              </p>
-              <p style={styles.metaText}>
-                <strong>기본 코스:</strong> {coursePath.length}포인트
-              </p>
-              <p style={styles.metaText}>
-                <strong>실시간 이동:</strong> {livePath.length}포인트
-              </p>
-              <p style={styles.metaText}>
-                <strong>저장 포인트:</strong> {savedPoints.length}개
-              </p>
-              <p style={styles.metaText}>
-                <strong>실시간 추적:</strong> {isWatching ? '켜짐' : '꺼짐'}
-              </p>
-              {loadingPoints && (
-                <p style={styles.metaText}>저장된 포인트 불러오는 중...</p>
+              <p style={styles.metaText}><strong>상태:</strong> {session.status}</p>
+              <p style={styles.metaText}><strong>시작 시간:</strong> {new Date(session.started_at).toLocaleString()}</p>
+              <p style={styles.metaText}><strong>경과 시간:</strong> {formatDuration(elapsedMs)}</p>
+              <p style={styles.metaText}><strong>누적 거리:</strong> {formatMeters(savedDistanceMeters)}</p>
+              <p style={styles.metaText}><strong>평균 페이스:</strong> {averagePaceMinPerKm > 0 ? `${averagePaceMinPerKm.toFixed(1)}분/km` : '-'}</p>
+              <p style={styles.metaText}><strong>저장 포인트:</strong> {savedPoints.length}개</p>
+              <p style={styles.metaText}><strong>실시간 추적:</strong> {isWatching ? '켜짐' : '꺼짐'}</p>
+              <p style={styles.metaText}><strong>자동 저장 기준:</strong> 12m 이상 이동 + 20초 이상 경과</p>
+              {currentPosition?.accuracy !== undefined && currentPosition?.accuracy !== null && (
+                <p style={styles.metaText}><strong>현재 정확도:</strong> {Math.round(currentPosition.accuracy)}m</p>
               )}
+              {loadingPoints && <p style={styles.metaText}>저장된 포인트 불러오는 중...</p>}
             </div>
 
             <div style={styles.buttonColumn}>
@@ -612,36 +760,30 @@ export default function TrackingPage() {
                 disabled={savingPoint}
                 style={styles.primaryButton}
               >
-                {savingPoint ? '위치 저장 중...' : '현재 위치 저장'}
+                {savingPoint ? '위치 저장 중...' : '현재 위치 수동 저장'}
               </button>
 
               <div style={styles.buttonRow}>
-                <button
-                  onClick={moveToCurrentLocation}
-                  style={styles.secondaryButton}
-                >
+                <button onClick={moveToCurrentLocation} style={styles.secondaryButton}>
                   내 위치 보기
                 </button>
 
-                <button
-                  onClick={fitCourseBounds}
-                  style={styles.secondaryButton}
-                >
-                  코스 전체 보기
+                <button onClick={fitCourseBounds} style={styles.secondaryButton}>
+                  전체 경로 보기
                 </button>
               </div>
 
               <div style={styles.buttonRow}>
                 <button
                   onClick={handleRestart}
-                  disabled={starting}
+                  disabled={starting || ending}
                   style={styles.secondaryButton}
                 >
                   {starting ? '재시작 중...' : '새 세션 시작'}
                 </button>
 
                 <button
-                  onClick={handleEndTracking}
+                  onClick={() => handleEndTracking()}
                   disabled={ending}
                   style={styles.endButton}
                 >
