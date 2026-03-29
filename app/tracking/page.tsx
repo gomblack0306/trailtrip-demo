@@ -13,6 +13,11 @@ type Session = {
   status: string;
   started_at: string;
   ended_at?: string | null;
+  title?: string | null;
+  note?: string | null;
+  total_distance_m?: number | null;
+  duration_sec?: number | null;
+  avg_pace_sec_per_km?: number | null;
 };
 
 type Point = {
@@ -21,6 +26,19 @@ type Point = {
   lng: number;
   accuracy?: number | null;
   recorded_at?: string;
+};
+
+type ResultSummary = {
+  sessionId: string;
+  startedAt: string;
+  endedAt: string;
+  totalDistanceMeters: number;
+  durationSec: number;
+  avgPaceSecPerKm: number | null;
+  pointCount: number;
+  points: Point[];
+  title?: string | null;
+  note?: string | null;
 };
 
 const STORAGE_KEY = 'trailtrip_tracking_session';
@@ -83,11 +101,59 @@ function formatDuration(ms: number) {
   return `${seconds}초`;
 }
 
+function formatPace(avgPaceSecPerKm: number | null) {
+  if (!avgPaceSecPerKm || !Number.isFinite(avgPaceSecPerKm)) return '-';
+  const minutes = Math.floor(avgPaceSecPerKm / 60);
+  const seconds = Math.round(avgPaceSecPerKm % 60);
+  return `${minutes}' ${String(seconds).padStart(2, '0')}"/km`;
+}
+
+function calculateDistance(points: Point[]) {
+  if (points.length < 2) return 0;
+  let total = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    total += getDistanceMeters(points[i - 1], points[i]);
+  }
+  return total;
+}
+
+function buildSummary(session: Session, points: Point[]): ResultSummary {
+  const sortedPoints = [...points].sort(
+    (a, b) =>
+      new Date(a.recorded_at ?? '').getTime() -
+      new Date(b.recorded_at ?? '').getTime()
+  );
+
+  const totalDistanceMeters = calculateDistance(sortedPoints);
+  const startedAt = session.started_at;
+  const endedAt = session.ended_at ?? new Date().toISOString();
+  const durationSec = Math.max(
+    0,
+    Math.floor((new Date(endedAt).getTime() - new Date(startedAt).getTime()) / 1000)
+  );
+  const avgPaceSecPerKm =
+    totalDistanceMeters > 0 ? durationSec / (totalDistanceMeters / 1000) : null;
+
+  return {
+    sessionId: session.id,
+    startedAt,
+    endedAt,
+    totalDistanceMeters,
+    durationSec,
+    avgPaceSecPerKm,
+    pointCount: sortedPoints.length,
+    points: sortedPoints,
+    title: session.title ?? '',
+    note: session.note ?? '',
+  };
+}
+
 export default function TrackingPage() {
   const [session, setSession] = useState<Session | null>(null);
   const [loading, setLoading] = useState(true);
   const [starting, setStarting] = useState(false);
   const [savingPoint, setSavingPoint] = useState(false);
+  const [savingResult, setSavingResult] = useState(false);
   const [loadingPoints, setLoadingPoints] = useState(false);
   const [ending, setEnding] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -98,6 +164,9 @@ export default function TrackingPage() {
   const [currentPosition, setCurrentPosition] = useState<Point | null>(null);
   const [isWatching, setIsWatching] = useState(false);
   const [nowTs, setNowTs] = useState(Date.now());
+  const [resultSummary, setResultSummary] = useState<ResultSummary | null>(null);
+  const [resultTitle, setResultTitle] = useState('');
+  const [resultNote, setResultNote] = useState('');
 
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<any>(null);
@@ -111,20 +180,12 @@ export default function TrackingPage() {
   const lastSavedAtRef = useRef<number>(0);
   const autoSavingRef = useRef(false);
 
-  const savedDistanceMeters = useMemo(() => {
-    if (savedPoints.length < 2) return 0;
-    let total = 0;
-    for (let i = 1; i < savedPoints.length; i += 1) {
-      total += getDistanceMeters(savedPoints[i - 1], savedPoints[i]);
-    }
-    return total;
-  }, [savedPoints]);
+  const savedDistanceMeters = useMemo(() => calculateDistance(savedPoints), [savedPoints]);
 
   const startedAtMs = session?.started_at ? new Date(session.started_at).getTime() : 0;
   const elapsedMs = session ? nowTs - startedAtMs : 0;
-  const averagePaceMinPerKm = savedDistanceMeters > 0
-    ? elapsedMs / 1000 / 60 / (savedDistanceMeters / 1000)
-    : 0;
+  const averagePaceSecPerKm =
+    savedDistanceMeters > 0 ? elapsedMs / 1000 / (savedDistanceMeters / 1000) : 0;
 
   useEffect(() => {
     restoreSession();
@@ -172,7 +233,7 @@ export default function TrackingPage() {
 
   useEffect(() => {
     renderSavedPointsAndPath();
-  }, [savedPoints]);
+  }, [savedPoints, resultSummary]);
 
   useEffect(() => {
     renderLivePath();
@@ -199,6 +260,8 @@ export default function TrackingPage() {
           status: parsed.status,
           started_at: parsed.started_at ?? new Date().toISOString(),
           ended_at: parsed.ended_at ?? null,
+          title: parsed.title ?? '',
+          note: parsed.note ?? '',
         });
       } else {
         localStorage.removeItem(STORAGE_KEY);
@@ -278,18 +341,24 @@ export default function TrackingPage() {
       savedPolylineRef.current = null;
     }
 
-    if (!savedPoints.length) return;
+    const targetPoints = resultSummary?.points?.length ? resultSummary.points : savedPoints;
+    if (!targetPoints.length) return;
 
-    const path = savedPoints.map(
+    const path = targetPoints.map(
       (point) => new window.kakao.maps.LatLng(point.lat, point.lng)
     );
 
-    savedPoints.forEach((point, index) => {
+    const first = targetPoints[0];
+    const last = targetPoints[targetPoints.length - 1];
+
+    [
+      { point: first, title: '시작' },
+      { point: last, title: '종료' },
+    ].forEach(({ point, title }) => {
       const marker = new window.kakao.maps.Marker({
         position: new window.kakao.maps.LatLng(point.lat, point.lng),
-        title: `저장 포인트 ${index + 1}`,
+        title,
       });
-
       marker.setMap(mapRef.current);
       marker.setZIndex(2);
       savedMarkersRef.current.push(marker);
@@ -306,6 +375,10 @@ export default function TrackingPage() {
         zIndex: 3,
       });
     }
+
+    const bounds = new window.kakao.maps.LatLngBounds();
+    path.forEach((latlng) => bounds.extend(latlng));
+    mapRef.current.setBounds(bounds);
   }
 
   function renderLivePath() {
@@ -341,7 +414,7 @@ export default function TrackingPage() {
       currentMarkerRef.current = null;
     }
 
-    if (!currentPosition) return;
+    if (!currentPosition || !session) return;
 
     currentMarkerRef.current = new window.kakao.maps.CustomOverlay({
       position: new window.kakao.maps.LatLng(
@@ -509,7 +582,11 @@ export default function TrackingPage() {
   function fitCourseBounds() {
     if (!mapRef.current || !window.kakao || !window.kakao.maps) return;
 
-    const targetPoints = savedPoints.length ? savedPoints : coursePath;
+    const targetPoints = resultSummary?.points?.length
+      ? resultSummary.points
+      : savedPoints.length
+      ? savedPoints
+      : coursePath;
     if (!targetPoints.length) return;
 
     const bounds = new window.kakao.maps.LatLngBounds();
@@ -557,6 +634,9 @@ export default function TrackingPage() {
       setStarting(true);
       setError(null);
       setPointMessage(null);
+      setResultSummary(null);
+      setResultTitle('');
+      setResultNote('');
 
       const res = await fetch('/api/session', {
         method: 'POST',
@@ -565,7 +645,7 @@ export default function TrackingPage() {
         },
         body: JSON.stringify({
           trailId: DEFAULT_TRAIL_ID,
-          reuseActive: true,
+          reuseActive: false,
         }),
       });
 
@@ -580,6 +660,8 @@ export default function TrackingPage() {
         status: data.session.status ?? 'active',
         started_at: data.session.started_at ?? new Date().toISOString(),
         ended_at: data.session.ended_at ?? null,
+        title: data.session.title ?? '',
+        note: data.session.note ?? '',
       };
 
       setSession(newSession);
@@ -609,6 +691,9 @@ export default function TrackingPage() {
     setSavedPoints([]);
     setLivePath([]);
     setCurrentPosition(null);
+    setResultSummary(null);
+    setResultTitle('');
+    setResultNote('');
     lastSavedPointRef.current = null;
     lastSavedAtRef.current = 0;
   }
@@ -636,13 +721,28 @@ export default function TrackingPage() {
       setError(null);
       setPointMessage(null);
 
+      let finalPoints = [...savedPoints];
+
       if (currentPosition) {
         try {
-          await persistPoint(currentPosition, 'auto');
+          const saved = await persistPoint(currentPosition, 'auto');
+          if (saved) {
+            finalPoints = [
+              ...finalPoints,
+              {
+                lat: currentPosition.lat,
+                lng: currentPosition.lng,
+                accuracy: currentPosition.accuracy,
+                recorded_at: new Date().toISOString(),
+              },
+            ];
+          }
         } catch (finalPointError) {
           console.error('종료 직전 마지막 포인트 저장 실패:', finalPointError);
         }
       }
+
+      const temporarySummary = buildSummary(session, finalPoints);
 
       const res = await fetch('/api/session', {
         method: 'PATCH',
@@ -651,6 +751,10 @@ export default function TrackingPage() {
         },
         body: JSON.stringify({
           sessionId: session.id,
+          completeSession: true,
+          totalDistanceMeters: temporarySummary.totalDistanceMeters,
+          durationSec: temporarySummary.durationSec,
+          avgPaceSecPerKm: temporarySummary.avgPaceSecPerKm,
         }),
       });
 
@@ -659,17 +763,24 @@ export default function TrackingPage() {
         throw new Error(`세션 종료 실패: ${res.status} ${text}`);
       }
 
+      const data = await res.json();
+      const endedSession: Session = data.session;
+      const summary = buildSummary(endedSession, finalPoints);
+
       stopWatchingPosition();
       localStorage.removeItem(STORAGE_KEY);
       setSession(null);
       setSavedPoints([]);
       setLivePath([]);
       setCurrentPosition(null);
+      setResultSummary(summary);
+      setResultTitle(summary.title ?? '');
+      setResultNote(summary.note ?? '');
       lastSavedPointRef.current = null;
       lastSavedAtRef.current = 0;
 
       if (!options?.quiet) {
-        setPointMessage('트래킹을 종료했고 마지막 위치까지 저장했어.');
+        setPointMessage('트래킹 결과를 확인하고 이름을 저장해줘.');
       }
 
       return true;
@@ -710,6 +821,58 @@ export default function TrackingPage() {
     }
   }
 
+  async function handleSaveResult() {
+    if (!resultSummary) {
+      setError('저장할 결과가 없어.');
+      return;
+    }
+
+    try {
+      setSavingResult(true);
+      setError(null);
+      setPointMessage(null);
+
+      const res = await fetch('/api/session', {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          sessionId: resultSummary.sessionId,
+          title: resultTitle.trim() || null,
+          note: resultNote.trim() || null,
+          totalDistanceMeters: resultSummary.totalDistanceMeters,
+          durationSec: resultSummary.durationSec,
+          avgPaceSecPerKm: resultSummary.avgPaceSecPerKm,
+        }),
+      });
+
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`결과 저장 실패: ${res.status} ${text}`);
+      }
+
+      const data = await res.json();
+      setResultSummary((prev) =>
+        prev
+          ? {
+              ...prev,
+              title: data.session.title ?? '',
+              note: data.session.note ?? '',
+            }
+          : prev
+      );
+      setPointMessage('결과 이름과 메모를 저장했어.');
+    } catch (err) {
+      console.error(err);
+      setError(
+        err instanceof Error ? err.message : '결과 저장 중 오류가 발생했어.'
+      );
+    } finally {
+      setSavingResult(false);
+    }
+  }
+
   if (loading) {
     return (
       <main style={styles.page}>
@@ -725,7 +888,7 @@ export default function TrackingPage() {
 
         <div ref={mapContainerRef} style={styles.mapBox} />
 
-        {!session ? (
+        {!session && !resultSummary ? (
           <>
             <p style={styles.desc}>현재 진행 중인 트래킹 세션이 없어.</p>
             <button
@@ -736,15 +899,17 @@ export default function TrackingPage() {
               {starting ? '시작 중...' : '트래킹 시작'}
             </button>
           </>
-        ) : (
+        ) : null}
+
+        {session ? (
           <>
             <div style={styles.statusBox}>
               <p style={styles.label}>현재 트래킹 진행 중</p>
               <p style={styles.metaText}><strong>상태:</strong> {session.status}</p>
-              <p style={styles.metaText}><strong>시작 시간:</strong> {new Date(session.started_at).toLocaleString()}</p>
+              <p style={styles.metaText}><strong>시작 시간:</strong> {new Date(session.started_at).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</p>
               <p style={styles.metaText}><strong>경과 시간:</strong> {formatDuration(elapsedMs)}</p>
               <p style={styles.metaText}><strong>누적 거리:</strong> {formatMeters(savedDistanceMeters)}</p>
-              <p style={styles.metaText}><strong>평균 페이스:</strong> {averagePaceMinPerKm > 0 ? `${averagePaceMinPerKm.toFixed(1)}분/km` : '-'}</p>
+              <p style={styles.metaText}><strong>평균 페이스:</strong> {formatPace(averagePaceSecPerKm)}</p>
               <p style={styles.metaText}><strong>저장 포인트:</strong> {savedPoints.length}개</p>
               <p style={styles.metaText}><strong>실시간 추적:</strong> {isWatching ? '켜짐' : '꺼짐'}</p>
               <p style={styles.metaText}><strong>자동 저장 기준:</strong> 12m 이상 이동 + 20초 이상 경과</p>
@@ -796,7 +961,48 @@ export default function TrackingPage() {
               </div>
             </div>
           </>
-        )}
+        ) : null}
+
+        {resultSummary ? (
+          <div style={styles.resultBox}>
+            <p style={styles.label}>이번 트래킹 결과</p>
+            <p style={styles.metaText}><strong>시작 시간:</strong> {new Date(resultSummary.startedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</p>
+            <p style={styles.metaText}><strong>종료 시간:</strong> {new Date(resultSummary.endedAt).toLocaleString('ko-KR', { timeZone: 'Asia/Seoul' })}</p>
+            <p style={styles.metaText}><strong>총 거리:</strong> {formatMeters(resultSummary.totalDistanceMeters)}</p>
+            <p style={styles.metaText}><strong>총 시간:</strong> {formatDuration(resultSummary.durationSec * 1000)}</p>
+            <p style={styles.metaText}><strong>평균 페이스:</strong> {formatPace(resultSummary.avgPaceSecPerKm)}</p>
+            <p style={styles.metaText}><strong>기록 포인트:</strong> {resultSummary.pointCount}개</p>
+
+            <div style={styles.formGroup}>
+              <label style={styles.inputLabel}>코스 이름</label>
+              <input
+                value={resultTitle}
+                onChange={(e) => setResultTitle(e.target.value)}
+                placeholder="예: 한라산 테스트 코스"
+                style={styles.textInput}
+              />
+            </div>
+
+            <div style={styles.formGroup}>
+              <label style={styles.inputLabel}>메모</label>
+              <textarea
+                value={resultNote}
+                onChange={(e) => setResultNote(e.target.value)}
+                placeholder="느낀 점이나 보완할 점을 적어둬"
+                style={styles.textArea}
+              />
+            </div>
+
+            <div style={styles.buttonColumn}>
+              <button onClick={handleSaveResult} disabled={savingResult} style={styles.primaryButton}>
+                {savingResult ? '저장 중...' : '결과 이름 저장'}
+              </button>
+              <button onClick={handleStartTracking} disabled={starting} style={styles.secondaryButton}>
+                {starting ? '시작 중...' : '새 트래킹 시작'}
+              </button>
+            </div>
+          </div>
+        ) : null}
 
         {pointMessage && <p style={styles.success}>{pointMessage}</p>}
         {error && <p style={styles.error}>{error}</p>}
@@ -849,6 +1055,14 @@ const styles: Record<string, CSSProperties> = {
     marginBottom: '16px',
     lineHeight: 1.7,
   },
+  resultBox: {
+    background: '#f8f6ef',
+    borderRadius: '14px',
+    padding: '16px',
+    marginBottom: '16px',
+    lineHeight: 1.7,
+    border: '1px solid #eadfbe',
+  },
   label: {
     fontSize: '16px',
     fontWeight: 700,
@@ -869,6 +1083,34 @@ const styles: Record<string, CSSProperties> = {
     display: 'flex',
     flexDirection: 'column',
     gap: '10px',
+  },
+  formGroup: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '6px',
+    marginTop: '12px',
+    marginBottom: '12px',
+  },
+  inputLabel: {
+    fontSize: '13px',
+    fontWeight: 700,
+    color: '#444',
+  },
+  textInput: {
+    width: '100%',
+    padding: '14px 14px',
+    borderRadius: '12px',
+    border: '1px solid #d0d7de',
+    fontSize: '15px',
+  },
+  textArea: {
+    width: '100%',
+    minHeight: '90px',
+    padding: '14px 14px',
+    borderRadius: '12px',
+    border: '1px solid #d0d7de',
+    fontSize: '15px',
+    resize: 'vertical',
   },
   primaryButton: {
     width: '100%',

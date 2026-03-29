@@ -16,6 +16,19 @@ function getSupabaseAdmin() {
   return createClient(supabaseUrl, supabaseServiceRoleKey);
 }
 
+const SESSION_SELECT = `
+  id,
+  trail_id,
+  status,
+  started_at,
+  ended_at,
+  title,
+  note,
+  total_distance_m,
+  duration_sec,
+  avg_pace_sec_per_km
+`;
+
 export async function GET() {
   return NextResponse.json(
     {
@@ -35,40 +48,6 @@ export async function POST(req: NextRequest) {
       typeof body?.trailId === 'string' && body.trailId.trim()
         ? body.trailId.trim()
         : 'demo-trail-001';
-    const reuseActive = body?.reuseActive !== false;
-
-    if (reuseActive) {
-      const { data: existing, error: existingError } = await supabase
-        .from('trekking_sessions')
-        .select('id, trail_id, status, started_at, ended_at')
-        .eq('trail_id', trailId)
-        .eq('status', 'active')
-        .order('started_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
-
-      if (existingError) {
-        console.error('[TRACKING_SESSION_FIND_ACTIVE_ERROR]', existingError);
-        return NextResponse.json(
-          {
-            error: '기존 active 세션 조회 실패',
-            detail: existingError.message,
-          },
-          { status: 500 }
-        );
-      }
-
-      if (existing) {
-        return NextResponse.json(
-          {
-            ok: true,
-            reused: true,
-            session: existing,
-          },
-          { status: 200 }
-        );
-      }
-    }
 
     const startedAt = new Date().toISOString();
 
@@ -79,7 +58,7 @@ export async function POST(req: NextRequest) {
         status: 'active',
         started_at: startedAt,
       })
-      .select('id, trail_id, status, started_at, ended_at')
+      .select(SESSION_SELECT)
       .single();
 
     if (error) {
@@ -127,40 +106,85 @@ export async function PATCH(req: NextRequest) {
       );
     }
 
-    const endedAt = new Date().toISOString();
+    const { data: existing, error: existingError } = await supabase
+      .from('trekking_sessions')
+      .select(SESSION_SELECT)
+      .eq('id', sessionId)
+      .maybeSingle();
+
+    if (existingError) {
+      return NextResponse.json(
+        { error: '세션 조회 실패', detail: existingError.message },
+        { status: 500 }
+      );
+    }
+
+    if (!existing) {
+      return NextResponse.json(
+        { error: '세션을 찾지 못했습니다.' },
+        { status: 404 }
+      );
+    }
+
+    const updateData: Record<string, unknown> = {};
+
+    if (body?.completeSession === true && existing.status === 'active') {
+      updateData.status = 'completed';
+      updateData.ended_at = new Date().toISOString();
+    }
+
+    if (typeof body?.title === 'string' || body?.title === null) {
+      updateData.title = body.title;
+    }
+
+    if (typeof body?.note === 'string' || body?.note === null) {
+      updateData.note = body.note;
+    }
+
+    if (typeof body?.totalDistanceMeters === 'number') {
+      updateData.total_distance_m = body.totalDistanceMeters;
+    }
+
+    if (typeof body?.durationSec === 'number') {
+      updateData.duration_sec = Math.max(0, Math.round(body.durationSec));
+    }
+
+    if (
+      typeof body?.avgPaceSecPerKm === 'number' &&
+      Number.isFinite(body.avgPaceSecPerKm)
+    ) {
+      updateData.avg_pace_sec_per_km = Math.round(body.avgPaceSecPerKm);
+    }
+
+    if (Object.keys(updateData).length === 0) {
+      return NextResponse.json(
+        { ok: true, session: existing },
+        { status: 200 }
+      );
+    }
 
     const { data, error } = await supabase
       .from('trekking_sessions')
-      .update({
-        status: 'completed',
-        ended_at: endedAt,
-      })
+      .update(updateData)
       .eq('id', sessionId)
-      .eq('status', 'active')
-      .select('id, trail_id, status, started_at, ended_at');
+      .select(SESSION_SELECT)
+      .single();
 
     if (error) {
-      console.error('[TRACKING_SESSION_END_ERROR]', error);
+      console.error('[TRACKING_SESSION_PATCH_ERROR]', error);
       return NextResponse.json(
         {
-          error: '세션 종료 업데이트 실패',
+          error: '세션 업데이트 실패',
           detail: error.message,
         },
         { status: 500 }
       );
     }
 
-    if (!data || data.length === 0) {
-      return NextResponse.json(
-        { error: '종료할 active 세션을 찾지 못했습니다.' },
-        { status: 404 }
-      );
-    }
-
     return NextResponse.json(
       {
         ok: true,
-        session: data[0],
+        session: data,
       },
       { status: 200 }
     );
